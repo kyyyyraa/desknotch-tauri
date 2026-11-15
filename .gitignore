@@ -1,0 +1,14 @@
+# build & runtime besar
+src-tauri/target/
+desknotch-models/
+whisper-cuda/
+ui/dn-models/
+release/
+*.exe
+*.bin
+*.onnx
+*.ggml
+*.pdb
+# OS / editor
+Thumbs.db
+.DS_Store

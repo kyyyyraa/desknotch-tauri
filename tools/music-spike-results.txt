@@ -1,0 +1,16 @@
+=== SPIKE LRCLIB (fase 0) ===
+[OK get] Tulus - Hati-Hati di Jalan | sync=True wordsync=True instr=False dur=242.0 lines=41
+[OK get] Dewa 19 - Kangen | sync=True wordsync=False instr=False dur=334.0 lines=55
+[MISS] .Feast - Berdebu | get_err=HTTP Error 404: Not Found
+[OK get] Coldplay - Viva la Vida | sync=True wordsync=True instr=False dur=242.0 lines=54
+[OK get] Taylor Swift - Love Story | sync=True wordsync=True instr=False dur=235.0 lines=55
+[OK get] Sal Priadi - Amin Paling Serius | sync=True wordsync=True instr=False dur=306.0 lines=37
+[OK get] Hindia - Membasuh | sync=True wordsync=True instr=False dur=374.0 lines=70
+[OK search] Kenny G - Songbird | sync=False wordsync=False instr=True dur=249.0 lines=0
+
+=== DIRTY YOUTUBE TITLES (uji clean_title) ===
+[OK] raw='Tulus - Ruang Sendiri (Official Music Video)' -> artist='Tulus' track='Ruang Sendiri' | sync=True dur=269.0 lines=48
+[OK] raw='Nadin Amizah - Bertaut (Official Lyric Video)' -> artist='Nadin Amizah' track='Bertaut' | sync=True dur=316.0 lines=43
+[MISS] raw='Coldplay - Yellow (Official Video) HD' -> artist='Coldplay' track='Yellow HD'
+
+COVERAGE: 8/11 synced
