@@ -379,6 +379,8 @@
     var req = { query: q };
     if (p.hint) req.hint = String(p.hint);
     return invoke('files:search', req).then(function (hits) {
+      // simpan hasil utk tab Files (filter Hasil cari)
+      try { invoke('store:set', 'dnSearchResults', (hits || []).slice(0, 30)); } catch (e) {}
       if (!hits || !hits.length) throw new Error('tidak ada file yang cocok dengan ' + q);
       var top = hits[0];
       // "carikan file" means put it on the notch shelf. Opening it hijacked

@@ -113,8 +113,30 @@ pub async fn bridge_invoke(
             Ok(win::battery())
         }
         "dnptt:paste" => {
-            let text = args.get(0).and_then(|v| v.as_str()).unwrap_or("");
-            Ok(win::paste_text(text))
+            // Renderer mengirim {text}; string legacy tetap diterima.
+            let first = args.get(0);
+            let text = first
+                .and_then(|v| v.get("text"))
+                .and_then(|v| v.as_str())
+                .or_else(|| first.and_then(|v| v.as_str()))
+                .unwrap_or("")
+                .to_string();
+            Ok(win::paste_text(&text))
+        }
+        "dnptt:capture-target" => {
+            // Simpan HWND window yang aktif SEBELUM rekaman dimulai, supaya
+            // hasil dictate diklik ke tempat yang benar.
+            Ok(serde_json::json!({ "hwnd": win::capture_paste_target() }))
+        }
+        "dnptt:clear-target" => {
+            win::restore_paste_target();
+            Ok(Value::Bool(true))
+        }
+        "system:diagnose" => {
+            Ok(crate::system::diagnose_system().await)
+        }
+        "rates:get" => {
+            Ok(crate::rates::get_usd_idr().await)
         }
         "dnptt:get-foreground" => {
             Ok(win::get_foreground_window_info())
@@ -377,6 +399,31 @@ pub async fn bridge_invoke(
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.0);
             Ok(Value::Bool(crate::smtc::try_seek(pos)))
+        }
+        "clipboard:copy-image" => {
+            // Klik kartu gambar di riwayat clipboard: tulis balik ke clipboard
+            // Windows sebagai CF_DIB (data URL BMP -> bagian DIB saja).
+            let data = args
+                .get(0)
+                .and_then(|v| v.get("data_url"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let bytes = crate::clipboard::data_url_to_dib(&data);
+            match bytes {
+                Some(dib) => Ok(Value::Bool(crate::clipboard::copy_image_bmp(&dib))),
+                None => Ok(Value::Bool(false)),
+            }
+        }
+        "clipboard:copy" => {
+            // Klik item riwayat clipboard = salin kembali ke clipboard
+            let text = args
+                .get(0)
+                .and_then(|v| v.get("text"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Ok(Value::Bool(crate::clipboard::copy_text(&text)))
         }
         "notif:open" => {
             // Klik notifikasi tab Notif: fokus sumber + buka URL DI sumbernya

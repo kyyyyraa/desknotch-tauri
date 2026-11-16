@@ -35,7 +35,10 @@ windows-sys = { version = "0.59", features = [
     "Win32_Media_Audio",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Foundation",
-    "Win32_System_Registry"
+    "Win32_System_Registry",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole"
 ] }
 cpal = "0.15"
 rusqlite = { version = "0.41.1", features = ["bundled"] }

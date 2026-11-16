@@ -38,6 +38,20 @@
     }
     if (window.dnPtt.isActive && window.dnPtt.isActive()) return;
 
+    // Simpan window yang sedang aktif SEBELUM notch/UI ambil fokus, supaya
+    // hasil dictate ditempel ke tempat yang benar (bukan ke window app kita).
+    try {
+      if (window.bridge && window.bridge.invoke) {
+        window.bridge.invoke('dnptt:capture-target', {}).then(function (r) {
+          try {
+            if (window.bridge && window.bridge.send) {
+              window.bridge.send("dnptt:log", "capture target hwnd=" + ((r && r.hwnd) || 0));
+            }
+          } catch (_) {}
+        }).catch(function () {});
+      }
+    } catch (_) {}
+
     if (mode === 'command') {
       liveActive = true;
     } else {

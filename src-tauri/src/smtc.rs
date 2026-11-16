@@ -179,6 +179,30 @@ impl SmtcWatcher {
     }
 }
 
+// Judul window foreground (mis. "The 1975 - About You (Official) - YouTube -
+// Zen Browser"). Dipakai untuk memilih sesi media yang benar: Zen mendaftarkan
+// satu sesi media per tab, jadi GetCurrentSession bisa mengembalikan lagu dari
+// tab lain (mis. playlist lama) sementara Now Playing.
+fn foreground_title() -> String {
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetForegroundWindow() -> *mut core::ffi::c_void;
+        fn GetWindowTextW(hwnd: *mut core::ffi::c_void, s: *mut u16, n: i32) -> i32;
+    }
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_null() {
+            return String::new();
+        }
+        let mut buf = [0u16; 512];
+        let len = GetWindowTextW(hwnd, buf.as_mut_ptr(), 512);
+        if len <= 0 {
+            return String::new();
+        }
+        String::from_utf16_lossy(&buf[..len as usize]).to_lowercase()
+    }
+}
+
 pub fn get_current_session_info() -> Option<Value> {
     unsafe {
         let _ = CoInitializeEx(std::ptr::null_mut(), 0);
@@ -186,7 +210,7 @@ pub fn get_current_session_info() -> Option<Value> {
     let manager_op = GlobalSystemMediaTransportControlsSessionManager::RequestAsync().ok()?;
     let manager = manager_op.get().ok()?;
 
-    let session = match manager.GetCurrentSession() {
+    let mut session = match manager.GetCurrentSession() {
         Ok(s) => s,
         Err(_) => {
             let sessions = manager.GetSessions().ok()?;
@@ -216,6 +240,52 @@ pub fn get_current_session_info() -> Option<Value> {
         .SourceAppUserModelId()
         .map(|h| h.to_string())
         .unwrap_or_default();
+
+    // Zen/Chrome mendaftarkan beberapa sesi media (satu per tab). Sesi yang
+    // benar biasanya yang judulnya muncul di judul window foreground. Kalau
+    // tidak cocok, cari sesi lain yang SEDANG DIPUTAR dan judulnya cocok.
+    {
+        let fg = foreground_title();
+        if !fg.is_empty() {
+            let cur_title = match session.TryGetMediaPropertiesAsync() {
+                Ok(o) => match o.get() {
+                    Ok(pr) => pr.Title().map(|h| h.to_string()).unwrap_or_default().to_lowercase(),
+                    Err(_) => String::new(),
+                },
+                Err(_) => String::new(),
+            };
+            if !cur_title.is_empty() && !fg.contains(&cur_title) {
+                if let Ok(sessions) = manager.GetSessions() {
+                    if let Ok(count) = sessions.Size() {
+                        for k in 0..count {
+                            if let Ok(cand) = sessions.GetAt(k) {
+                                let playing = cand
+                                    .GetPlaybackInfo()
+                                    .ok()
+                                    .and_then(|p| p.PlaybackStatus().ok())
+                                    .map(|st| st.0 == 4)
+                                    .unwrap_or(false);
+                                if !playing {
+                                    continue;
+                                }
+                                let ctitle = match cand.TryGetMediaPropertiesAsync() {
+                                    Ok(o) => match o.get() {
+                                        Ok(pr) => pr.Title().map(|h| h.to_string()).unwrap_or_default().to_lowercase(),
+                                        Err(_) => String::new(),
+                                    },
+                                    Err(_) => String::new(),
+                                };
+                                if !ctitle.is_empty() && fg.contains(&ctitle) {
+                                    session = cand;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     let props_op = session.TryGetMediaPropertiesAsync().ok()?;
     let props = props_op.get().ok()?;

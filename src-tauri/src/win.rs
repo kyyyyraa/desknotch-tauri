@@ -5,6 +5,18 @@
 //! state and pasting text into the previously focused window.
 
 use serde_json::{json, Value};
+use std::sync::{Mutex, OnceLock};
+
+/// HWND window yang harus menerima hasil paste.
+///
+/// Di-capture SEBELUM user pindah fokus ke UI notch/voice, karena saat
+/// perintah paste sampai, window foreground sudah jadi UI DeskNotch — paste
+/// akan mendarat di window yang salah kalau cuma_andalkan GetForegroundWindow.
+static PASTE_TARGET: OnceLock<Mutex<Option<usize>>> = OnceLock::new();
+
+fn paste_target_slot() -> &'static Mutex<Option<usize>> {
+    PASTE_TARGET.get_or_init(|| Mutex::new(None))
+}
 
 #[cfg(windows)]
 mod platform {
@@ -54,9 +66,12 @@ mod platform {
         pub fn CloseClipboard() -> BOOL;
         pub fn EmptyClipboard() -> BOOL;
         pub fn SetClipboardData(format: UINT, data: HANDLE) -> HANDLE;
-        pub fn GetForegroundWindow() -> HWND;
         pub fn GetWindowTextW(hwnd: HWND, lpString: *mut u16, nMaxCount: i32) -> i32;
         pub fn SendInput(count: UINT, inputs: *mut INPUT, size: i32) -> UINT;
+        // AttachThreadInput tidak ada di windows-sys::Win32::UI::WindowsAndMessaging
+        // (di bindings itu dia ada di Win32::System::Threading, dan feature-nya
+        // tidak aktif di Cargo.toml), jadi dideklarasi langsung di sini.
+        pub fn AttachThreadInput(idattach: DWORD, idattachto: DWORD, fattach: BOOL) -> BOOL;
     }
 
     #[link(name = "kernel32")]
@@ -65,6 +80,9 @@ mod platform {
         pub fn GlobalLock(mem: HANDLE) -> *mut c_void;
         pub fn GlobalUnlock(mem: HANDLE) -> BOOL;
         pub fn GetSystemPowerStatus(status: *mut SYSTEM_POWER_STATUS) -> BOOL;
+        // Sama seperti AttachThreadInput: windows-sys menaruhnya di
+        // Win32::System::Threading yang tidak aktif, jadi declare manual.
+        pub fn GetCurrentThreadId() -> DWORD;
     }
 }
 
@@ -111,6 +129,7 @@ pub fn battery() -> Value {
 #[cfg(windows)]
 pub fn get_foreground_window_info() -> Value {
     use platform::*;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
     unsafe {
         let hwnd = GetForegroundWindow();
         if hwnd.is_null() {
@@ -132,20 +151,135 @@ pub fn get_foreground_window_info() -> Value {
     json!({ "hwnd": 0, "title": "" })
 }
 
+/// Captures the current foreground window as the paste target and returns its
+/// handle (0 when there is no foreground window).
+///
+/// Call this BEFORE the recording starts, while the user's application still
+/// has focus. `paste_text` then restores focus to this window instead of
+/// pasting into the DeskNotch UI.
+#[cfg(windows)]
+pub fn capture_paste_target() -> usize {
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+
+    let hwnd = unsafe { GetForegroundWindow() };
+    let value = if hwnd.is_null() { 0 } else { hwnd as usize };
+
+    if let Ok(mut slot) = paste_target_slot().lock() {
+        *slot = if value == 0 { None } else { Some(value) };
+    }
+
+    value
+}
+
+#[cfg(not(windows))]
+pub fn capture_paste_target() -> usize {
+    0
+}
+
+/// Forgets the captured paste target (call when the recording is done).
+pub fn restore_paste_target() {
+    if let Ok(mut slot) = paste_target_slot().lock() {
+        *slot = None;
+    }
+}
+
+/// HWND target yang tersimpan, kalau ada.
+#[cfg(windows)]
+fn stored_paste_target() -> Option<platform::HWND> {
+    paste_target_slot()
+        .lock()
+        .ok()
+        .and_then(|slot| *slot)
+        .map(|hwnd| hwnd as platform::HWND)
+}
+
+/// Brings `target` to the foreground and reports whether it really is the
+/// foreground window afterwards.
+///
+/// Windows blocks `SetForegroundWindow` when the caller does not own the
+/// foreground input, so we attach to the input threads of the current
+/// foreground window and of the target before calling it.
+#[cfg(windows)]
+fn focus_window(target: platform::HWND) -> bool {
+    use platform::{AttachThreadInput, GetCurrentThreadId};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowThreadProcessId, IsIconic, SetForegroundWindow, ShowWindow,
+        SW_RESTORE,
+    };
+
+    unsafe {
+        if GetForegroundWindow() == target {
+            return true;
+        }
+
+        // A minimized window cannot take the focus, so restore it first.
+        if IsIconic(target) != 0 {
+            ShowWindow(target, SW_RESTORE);
+        }
+
+        let current_thread = GetCurrentThreadId();
+        let foreground = GetForegroundWindow();
+
+        let foreground_thread = if foreground.is_null() {
+            0
+        } else {
+            GetWindowThreadProcessId(foreground, std::ptr::null_mut())
+        };
+        let target_thread = GetWindowThreadProcessId(target, std::ptr::null_mut());
+
+        let mut attached_foreground = false;
+        let mut attached_target = false;
+
+        if foreground_thread != 0 && foreground_thread != current_thread {
+            attached_foreground = AttachThreadInput(current_thread, foreground_thread, 1) != 0;
+        }
+        if target_thread != 0 && target_thread != current_thread {
+            attached_target = AttachThreadInput(current_thread, target_thread, 1) != 0;
+        }
+
+        SetForegroundWindow(target);
+
+        if attached_foreground {
+            AttachThreadInput(current_thread, foreground_thread, 0);
+        }
+        if attached_target {
+            AttachThreadInput(current_thread, target_thread, 0);
+        }
+
+        GetForegroundWindow() == target
+    }
+}
+
 /// Writes `text` to the clipboard and replays Ctrl+V into the window that had
 /// focus when the request arrived.
+///
+/// The target window is the one captured by `capture_paste_target()` (called
+/// before the recording started), because by the time this runs the focus
+/// already moved to the DeskNotch UI. Falls back to the current foreground
+/// window when nothing was captured.
 #[cfg(windows)]
 pub fn paste_text(text: &str) -> Value {
     use platform::*;
     use std::ptr;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
     if text.is_empty() {
         return json!({ "ok": false, "reason": "empty" });
     }
 
-    let target = unsafe { GetForegroundWindow() };
+    let target = match stored_paste_target() {
+        Some(hwnd) => hwnd,
+        None => unsafe { GetForegroundWindow() },
+    };
     if target.is_null() {
-        return json!({ "ok": false, "reason": "no foreground window" });
+        return json!({ "ok": false, "reason": "no target window" });
+    }
+
+    // Give the focus back to the target app. Windows may refuse
+    // (foreground lock), and in that case we must not pretend the paste
+    // worked.
+    if !focus_window(target) {
+        return json!({ "ok": false, "reason": "foreground-lock" });
     }
 
     let mut wide: Vec<u16> = text.encode_utf16().collect();

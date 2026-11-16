@@ -21,6 +21,12 @@ struct RECT {
 }
 
 #[repr(C)]
+#[repr(C)]
+struct POINT {
+    x: i32,
+    y: i32,
+}
+
 struct MONITORINFO {
     cb_size: u32,
     rc_monitor: RECT,
@@ -48,8 +54,10 @@ const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
 const INVALID_HANDLE_VALUE: isize = -1;
 
 /// Browsers whose tabs and address bar sit right under the notch.
-const TUCK_BROWSERS: [&str; 7] = [
+const TUCK_BROWSERS: [&str; 9] = [
     "chrome", "msedge", "brave", "firefox", "opera", "vivaldi", "arc",
+    // Zen Browser (Firefox-based) — nama prosesnya "zen"
+    "zen", "zenbrowser",
 ];
 
 /// The exam browser's own executables. SafeExamBrowser.Service is left out on
@@ -66,6 +74,8 @@ extern "system" {
     fn GetClassNameW(hWnd: HWND, lpClassName: *mut u16, nMaxCount: i32) -> i32;
     fn GetWindowTextW(hWnd: HWND, lpString: *mut u16, nMaxCount: i32) -> i32;
     fn IsZoomed(hWnd: HWND) -> BOOL;
+    fn GetClientRect(hWnd: HWND, lpRect: *mut RECT) -> BOOL;
+    fn ClientToScreen(hWnd: HWND, lpPoint: *mut POINT) -> BOOL;
     fn GetWindowThreadProcessId(hWnd: HWND, lpdwProcessId: *mut u32) -> u32;
 }
 
@@ -175,6 +185,17 @@ fn log_file() -> Option<std::path::PathBuf> {
 /// Records what the watcher sees, so the detection can be checked from a log
 /// instead of by watching the bar.
 fn log_state(foreground: &str, exam_open: bool, is_fullscreen: bool) {
+    log_state_detail(foreground, exam_open, is_fullscreen, (0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0));
+}
+
+fn log_state_detail(
+    foreground: &str,
+    exam_open: bool,
+    is_fullscreen: bool,
+    win: (i32, i32, i32, i32),
+    mon: (i32, i32, i32, i32),
+    cli: (i32, i32, i32, i32),
+) {
     use std::io::Write;
 
     let Some(path) = log_file() else {
@@ -191,7 +212,8 @@ fn log_state(foreground: &str, exam_open: bool, is_fullscreen: bool) {
             .unwrap_or(0);
         let _ = writeln!(
             file,
-            "{stamp} STATE foreground={foreground} exam_open={exam_open} fullscreen={is_fullscreen}"
+            "{stamp} STATE foreground={foreground} exam_open={exam_open} fullscreen={is_fullscreen} win={:?} mon={:?} cli={:?}",
+            win, mon, cli
         );
     }
 }
@@ -227,7 +249,8 @@ impl WindowWatcher {
             loop {
                 std::thread::sleep(Duration::from_millis(300));
 
-                let (is_fullscreen, exe_name) = unsafe { inspect_foreground() };
+                let fg = unsafe { inspect_foreground_detail() };
+                let (is_fullscreen, exe_name) = (fg.fullscreen, fg.exe.clone());
 
                 if exe_name == "self" {
                     continue;
@@ -250,7 +273,7 @@ impl WindowWatcher {
                 if exe_name != last_foreground || exam_open != last_exam_open {
                     last_foreground = exe_name.clone();
                     last_exam_open = exam_open;
-                    log_state(&exe_name, exam_open, is_fullscreen);
+                    log_state_detail(&exe_name, exam_open, is_fullscreen, fg.win, fg.mon, fg.cli);
                 }
 
                 // Handle hide on fullscreen. The exam browser is exempt: a
@@ -311,17 +334,30 @@ unsafe fn process_name(pid: u32) -> String {
     exe_name
 }
 
+struct FgDetail {
+    fullscreen: bool,
+    exe: String,
+    win: (i32, i32, i32, i32),
+    mon: (i32, i32, i32, i32),
+    cli: (i32, i32, i32, i32),
+}
+
 unsafe fn inspect_foreground() -> (bool, String) {
+    let d = inspect_foreground_detail();
+    (d.fullscreen, d.exe)
+}
+
+unsafe fn inspect_foreground_detail() -> FgDetail {
     let hwnd = GetForegroundWindow();
     if hwnd.is_null() {
-        return (false, String::new());
+        return FgDetail { fullscreen: false, exe: String::new(), win: (0,0,0,0), mon: (0,0,0,0), cli: (0,0,0,0) };
     }
 
     let mut title_buf = [0u16; 256];
     let title_len = GetWindowTextW(hwnd, title_buf.as_mut_ptr(), 256);
     let title = String::from_utf16_lossy(&title_buf[..title_len as usize]);
     if title == "DeskNotch" {
-        return (false, "self".to_string());
+        return FgDetail { fullscreen: false, exe: "self".to_string(), win: (0,0,0,0), mon: (0,0,0,0), cli: (0,0,0,0) };
     }
 
     let mut class_buf = [0u16; 256];
@@ -338,18 +374,59 @@ unsafe fn inspect_foreground() -> (bool, String) {
     mi.cb_size = std::mem::size_of::<MONITORINFO>() as u32;
 
     if GetMonitorInfoW(h_mon, &mut mi) == 0 {
-        return (false, String::new());
+        return FgDetail { fullscreen: false, exe: String::new(), win: (0,0,0,0), mon: (0,0,0,0), cli: (0,0,0,0) };
     }
 
     let mut rect: RECT = std::mem::zeroed();
     let mut is_fullscreen = false;
 
-    if !is_shell && IsZoomed(hwnd) == 0 && GetWindowRect(hwnd, &mut rect) != 0 {
+    // area klien (tanpa chrome browser) dalam koordinat layar
+    let mut cli_rect: (i32, i32, i32, i32) = (0, 0, 0, 0);
+    {
+        let mut cr = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        let mut origin = POINT { x: 0, y: 0 };
+        if GetClientRect(hwnd, &mut cr) != 0 && ClientToScreen(hwnd, &mut origin) != 0 {
+            cli_rect = (
+                origin.x,
+                origin.y,
+                origin.x + (cr.right - cr.left),
+                origin.y + (cr.bottom - cr.top),
+            );
+        }
+    }
+
+    // Fullscreen = jendela menutup SELURUH monitor (termasuk area taskbar).
+    // Syarat IsZoomed()==0 DIHAPUS: Zen/Firefox menampilkan video fullscreen
+    // dengan jendela tetap "zoomed" (maximized), sehingga syarat lama membuat
+    // Zen tidak pernah terdeteksi -> notch tetap nempel di atas video.
+    // Jendela yang hanya maximized (taskbar terlihat) rect-nya berhenti
+    // sebelum bawah monitor, jadi tidak salah positif.
+    if !is_shell && GetWindowRect(hwnd, &mut rect) != 0 {
         is_fullscreen = rect.left <= mi.rc_monitor.left + 2
             && rect.top <= mi.rc_monitor.top + 2
             && rect.right >= mi.rc_monitor.right - 2
             && rect.bottom >= mi.rc_monitor.bottom - 2;
     }
+
+    // Video fullscreen di browser: area klien (tanpa chrome) menutup monitor.
+    if !is_fullscreen && !is_shell {
+        let (cl, ct, cr_right, cr_bottom) = cli_rect;
+        if cl <= mi.rc_monitor.left + 2
+            && ct <= mi.rc_monitor.top + 2
+            && cr_right >= mi.rc_monitor.right - 2
+            && cr_bottom >= mi.rc_monitor.bottom - 2
+        {
+            is_fullscreen = true;
+        }
+    }
+
+    let win = (rect.left, rect.top, rect.right, rect.bottom);
+    let mon = (
+        mi.rc_monitor.left,
+        mi.rc_monitor.top,
+        mi.rc_monitor.right,
+        mi.rc_monitor.bottom,
+    );
 
     let mut pid = 0u32;
     GetWindowThreadProcessId(hwnd, &mut pid);
@@ -358,8 +435,8 @@ unsafe fn inspect_foreground() -> (bool, String) {
     // An elevated exam browser hides its path from a normal process, so the
     // window title is the fallback signal.
     if exe_name.is_empty() && title.to_lowercase().contains("safe exam browser") {
-        return (is_fullscreen, EXAM_APPS[0].to_string());
+        return FgDetail { fullscreen: is_fullscreen, exe: EXAM_APPS[0].to_string(), win, mon, cli: cli_rect };
     }
 
-    (is_fullscreen, exe_name)
+    FgDetail { fullscreen: is_fullscreen, exe: exe_name, win, mon, cli: cli_rect }
 }

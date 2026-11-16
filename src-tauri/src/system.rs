@@ -694,3 +694,285 @@ pub fn describe_file(path_str: &str) -> Option<Value> {
         "icon": Value::Null
     }))
 }
+
+// ---------------------------------------------------------------------------
+// Diagnostik sistem (read-only) — "kenapa laptop lambat?"
+// ---------------------------------------------------------------------------
+
+/// Batas keras diagnosa: script PowerShell tidak boleh menggantung, dan
+/// stdout-nya dibatasi supaya tidak membanjiri bridge.
+const DIAG_TIMEOUT_SECS: u64 = 15;
+const DIAG_MAX_OUTPUT: usize = 20 * 1024;
+
+/// Script PowerShell read-only. TIDAK ada input user yang di-embed di sini —
+/// seluruh query bersifat tetap, jadi tidak ada permukaan command injection.
+/// Outputnya satu objek JSON (ConvertTo-Json), diparse di Rust.
+const DIAG_PS_SCRIPT: &str = r#"
+$ErrorActionPreference = 'SilentlyContinue'
+try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
+
+$cpu = $null
+try {
+  $c = Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($c -and $null -ne $c.LoadPercentage) { $cpu = [double]$c.LoadPercentage }
+} catch {}
+
+$ramTotalKb = $null
+$ramFreeKb = $null
+try {
+  $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+  if ($os) {
+    if ($null -ne $os.TotalVisibleMemorySize) { $ramTotalKb = [double]$os.TotalVisibleMemorySize }
+    if ($null -ne $os.FreePhysicalMemory) { $ramFreeKb = [double]$os.FreePhysicalMemory }
+  }
+} catch {}
+
+$diskFree = $null
+$diskUsed = $null
+try {
+  $d = Get-PSDrive -Name C -ErrorAction SilentlyContinue
+  if ($d) { $diskFree = [double]$d.Free; $diskUsed = [double]$d.Used }
+  if ($null -eq $diskFree) {
+    $ld = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'" -ErrorAction SilentlyContinue
+    if ($ld) { $diskFree = [double]$ld.FreeSpace; $diskUsed = [double]$ld.Size }
+  }
+} catch {}
+
+$uptimeH = $null
+try {
+  $os2 = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+  if ($os2 -and $os2.LastBootUpTime) {
+    $uptimeH = [math]::Round(((Get-Date) - $os2.LastBootUpTime).TotalHours, 2)
+  }
+} catch {}
+
+$nCpu = 1
+try {
+  $n = [double](Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).NumberOfLogicalProcessors
+  if ($n -gt 0) { $nCpu = $n }
+} catch {}
+
+$prev = @{}
+try {
+  Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
+    if ($null -ne $_.CPU) { $prev[$_.Id] = [double]$_.CPU }
+  }
+} catch {}
+Start-Sleep -Milliseconds 900
+
+$procs = @()
+try {
+  $procs = @(Get-Process -ErrorAction SilentlyContinue | Sort-Object -Property WS -Descending | Select-Object -First 5 | ForEach-Object {
+    $p = $_
+    $before = 0.0
+    if ($prev.ContainsKey($p.Id)) { $before = [double]$prev[$p.Id] }
+    $after = 0.0
+    if ($null -ne $p.CPU) { $after = [double]$p.CPU }
+    $delta = $after - $before
+    if ($delta -lt 0) { $delta = 0 }
+    $mem = 0.0
+    if ($null -ne $p.WS) { $mem = [double]$p.WS }
+    [PSCustomObject]@{
+      name = [string]$p.Name
+      mem_mb = [math]::Round(($mem / 1MB), 1)
+      cpu = [math]::Round((($delta / 0.9) * 100.0 / $nCpu), 1)
+    }
+  })
+} catch {}
+
+[PSCustomObject]@{
+  cpu_pct = $cpu
+  ram_total_kb = $ramTotalKb
+  ram_free_kb = $ramFreeKb
+  disk_c_free = $diskFree
+  disk_c_used = $diskUsed
+  uptime_h = $uptimeH
+  top_processes = $procs
+} | ConvertTo-Json -Compress -Depth 4
+"#;
+
+/// Jalankan script PowerShell, bunuh prosesnya kalau melewati deadline,
+/// lalu kembalikan stdout yang sudah dipotong 20 KB.
+fn run_ps_script(script: &str, deadline: Duration) -> Result<String, String> {
+    let mut child = silent(&mut Command::new("powershell.exe"))
+        .args(&["-NoProfile", "-NonInteractive", "-Command", script])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("gagal menjalankan PowerShell: {}", e))?;
+
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if started.elapsed() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("PowerShell timeout".to_string());
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(format!("gagal menunggu PowerShell: {}", e)),
+        }
+    }
+
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("gagal membaca output PowerShell: {}", e))?;
+    let s = String::from_utf8_lossy(&out.stdout).to_string();
+    if s.len() > DIAG_MAX_OUTPUT {
+        Ok(String::from_utf8_lossy(&s.as_bytes()[..DIAG_MAX_OUTPUT]).to_string())
+    } else {
+        Ok(s)
+    }
+}
+
+fn jf(v: &Value, key: &str) -> Option<f64> {
+    v.get(key).and_then(|x| x.as_f64()).filter(|n| n.is_finite())
+}
+
+fn round1(n: f64) -> f64 {
+    (n * 10.0).round() / 10.0
+}
+
+/// Diagnostik read-only: metrik CPU / RAM / disk / uptime + 5 proses
+/// teratas by memory. Untuk menjawab "kenapa laptop lambat?" tanpa mengubah
+/// apa pun di sistem.
+pub async fn diagnose_system() -> Value {
+    let res = tokio::time::timeout(
+        Duration::from_secs(DIAG_TIMEOUT_SECS),
+        tokio::task::spawn_blocking({
+            let script = DIAG_PS_SCRIPT.to_string();
+            move || {
+                run_ps_script(
+                    &script,
+                    Duration::from_secs(DIAG_TIMEOUT_SECS.saturating_sub(1)),
+                )
+            }
+        }),
+    )
+    .await;
+
+    let raw = match res {
+        Ok(Ok(Ok(s))) => s,
+        Ok(Ok(Err(e))) => {
+            return serde_json::json!({ "ok": false, "reason": e });
+        }
+        Ok(Err(e)) => {
+            return serde_json::json!({
+                "ok": false,
+                "reason": format!("gagal menjalankan diagnostik: {}", e)
+            });
+        }
+        Err(_) => {
+            return serde_json::json!({
+                "ok": false,
+                "reason": "diagnostik timeout (15 detik)"
+            });
+        }
+    };
+
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return serde_json::json!({
+            "ok": false,
+            "reason": "PowerShell tidak mengembalikan output"
+        });
+    }
+
+    let data: Value = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(e) => {
+            return serde_json::json!({
+                "ok": false,
+                "reason": format!("output PowerShell bukan JSON yang valid: {}", e)
+            });
+        }
+    };
+
+    let mut notes: Vec<String> = Vec::new();
+
+    // --- CPU ---
+    let cpu_pct = jf(&data, "cpu_pct").map(round1);
+    if cpu_pct.is_none() {
+        notes.push("Gagal membaca beban CPU".to_string());
+    }
+
+    // --- RAM (KB -> GB) ---
+    let ram_total_gb = jf(&data, "ram_total_kb").map(|kb| round1(kb / 1024.0 / 1024.0));
+    let ram_used_gb = match (jf(&data, "ram_total_kb"), jf(&data, "ram_free_kb")) {
+        (Some(total), Some(free)) => {
+            let used = (total - free).max(0.0);
+            Some(round1(used / 1024.0 / 1024.0))
+        }
+        _ => None,
+    };
+    if ram_total_gb.is_none() || ram_used_gb.is_none() {
+        notes.push("Gagal membaca penggunaan RAM".to_string());
+    }
+
+    // --- Disk C: (byte -> GB) ---
+    let disk_c_free_gb = jf(&data, "disk_c_free").map(|b| round1(b / 1024.0 / 1024.0 / 1024.0));
+    let disk_c_total_gb = match (jf(&data, "disk_c_used"), jf(&data, "disk_c_free")) {
+        (Some(used), Some(free)) => Some(round1((used + free) / 1024.0 / 1024.0 / 1024.0)),
+        _ => None,
+    };
+    if disk_c_free_gb.is_none() || disk_c_total_gb.is_none() {
+        notes.push("Gagal membaca kapasitas disk C:".to_string());
+    }
+
+    // --- Uptime ---
+    let uptime_h = jf(&data, "uptime_h").map(round1);
+    if uptime_h.is_none() {
+        notes.push("Gagal membaca uptime sistem".to_string());
+    }
+
+    // --- Top proses ---
+    let top_processes: Value = match data.get("top_processes") {
+        Some(Value::Array(arr)) => Value::Array(
+            arr.iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "name": p.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                        "mem_mb": round1(jf(p, "mem_mb").unwrap_or(0.0)),
+                        "cpu": round1(jf(p, "cpu").unwrap_or(0.0)),
+                    })
+                })
+                .collect(),
+        ),
+        _ => {
+            notes.push("Gagal membaca daftar proses teratas".to_string());
+            Value::Null
+        }
+    };
+
+    // --- Analisis ringan ---
+    if let (Some(used), Some(total)) = (ram_used_gb, ram_total_gb) {
+        if total > 0.0 && (used / total) * 100.0 > 85.0 {
+            notes.push("RAM hampir penuh".to_string());
+        }
+    }
+    if let Some(c) = cpu_pct {
+        if c > 80.0 {
+            notes.push("CPU tinggi".to_string());
+        }
+    }
+    if let Some(free) = disk_c_free_gb {
+        if free < 15.0 {
+            notes.push("disk C: hampir penuh".to_string());
+        }
+    }
+
+    serde_json::json!({
+        "ok": true,
+        "cpu_pct": cpu_pct,
+        "ram_used_gb": ram_used_gb,
+        "ram_total_gb": ram_total_gb,
+        "disk_c_free_gb": disk_c_free_gb,
+        "disk_c_total_gb": disk_c_total_gb,
+        "uptime_h": uptime_h,
+        "top_processes": top_processes,
+        "notes": notes
+    })
+}

@@ -1,6 +1,7 @@
 pub mod approval_gate;
 pub mod bridge;
 pub mod click_through;
+pub mod clipboard;
 pub mod crypto;
 pub mod display;
 pub mod logfile;
@@ -9,6 +10,7 @@ pub mod notif;
 pub mod ocr;
 pub mod pipe_server;
 pub mod privacy;
+pub mod rates;
 pub mod screenshot;
 pub mod smtc;
 pub mod store;
@@ -80,6 +82,10 @@ pub fn run() {
             let smtc_watcher = smtc::SmtcWatcher::new();
             smtc_watcher.start(app.handle().clone());
 
+            // Start clipboard history watcher (poll CF_UNICODETEXT every 800ms,
+            // emits "clipboard:new" when the text changes)
+            clipboard::ClipboardWatcher::new().start(app.handle().clone());
+
             // Privacy sensor: watch the ConsentStore so the notch can show the
     // mic/camera dots. It only pushes an event when something changed.
     {
@@ -123,6 +129,33 @@ pub fn run() {
                         }
                     }
                 }
+
+                // Drag & drop files onto the notch: "files:drag" opens the
+                // files tab while hovering, "shelf:dropped" carries the
+                // dropped paths to the renderer.
+                let window_dd = window.clone();
+                window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::DragDrop(drag) = event {
+                        use tauri::Emitter;
+                        match drag {
+                            tauri::DragDropEvent::Enter { .. } => {
+                                let _ = window_dd.emit("files:drag", ());
+                            }
+                            tauri::DragDropEvent::Drop { paths, .. } => {
+                                let paths: Vec<String> = paths
+                                    .iter()
+                                    .map(|p| p.to_string_lossy().to_string())
+                                    .collect();
+                                let _ = window_dd.emit(
+                                    "shelf:dropped",
+                                    serde_json::json!({ "paths": paths }),
+                                );
+                            }
+                            // Leave (dan Over): tidak perlu emit.
+                            _ => {}
+                        }
+                    }
+                });
 
                 // Background watcher: keeps notch on top of MyFinder top bar and adjusts if resolution changes
                 let win_for_watcher = window.clone();

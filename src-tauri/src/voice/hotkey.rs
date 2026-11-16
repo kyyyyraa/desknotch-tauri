@@ -103,6 +103,15 @@ impl HotkeyManager {
                     0x43,
                 );
 
+                // Hotkey 5 (slot LIVE yang tidak terpakai): Ctrl + Alt + C ->
+                // buka tab Ask (tanya singkat)
+                RegisterHotKey(
+                    std::ptr::null_mut(),
+                    HOTKEY_LIVE,
+                    MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
+                    0x43,
+                );
+
                 let mut msg: MSG = std::mem::zeroed();
                 while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
                     if msg.message == WM_HOTKEY {
@@ -147,6 +156,10 @@ impl HotkeyManager {
                                 crate::logfile::append("[hotkey] alt+c -> open chat");
                                 let _ = app.emit("hotkey:chat", serde_json::json!({}));
                             }
+                            HOTKEY_LIVE => {
+                                crate::logfile::append("[hotkey] ctrl+alt+c -> open ask");
+                                let _ = app.emit("hotkey:ask", serde_json::json!({}));
+                            }
                             _ => {}
                         }
                     }
@@ -156,6 +169,7 @@ impl HotkeyManager {
                 UnregisterHotKey(std::ptr::null_mut(), HOTKEY_DICTATE);
                 UnregisterHotKey(std::ptr::null_mut(), HOTKEY_ESCAPE);
                 UnregisterHotKey(std::ptr::null_mut(), HOTKEY_CHAT);
+                UnregisterHotKey(std::ptr::null_mut(), HOTKEY_LIVE);
             }
         });
     }
