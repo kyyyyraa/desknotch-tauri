@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{Emitter, WebviewWindow};
@@ -14,21 +15,22 @@ pub struct Rect {
 #[derive(Clone)]
 pub struct ClickThroughManager {
     bounds: Arc<Mutex<Vec<Rect>>>,
-    last_cursor_inside: Arc<Mutex<bool>>,
+    last_cursor_inside: Arc<AtomicBool>,
 }
 
 impl ClickThroughManager {
     pub fn new() -> Self {
         Self {
             bounds: Arc::new(Mutex::new(Vec::new())),
-            last_cursor_inside: Arc::new(Mutex::new(false)),
+            last_cursor_inside: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn update_bounds(&self, rects: Vec<Rect>) {
-        if let Ok(mut guard) = self.bounds.lock() {
-            *guard = rects;
-        }
+        // Poison recovery: a panicked writer must not permanently freeze the
+        // bound list; the Vec is plain data and last writer wins.
+        let mut guard = self.bounds.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = rects;
     }
 
     /// Spawns background thread that tracks cursor position and toggles window.set_ignore_cursor_events
@@ -51,8 +53,15 @@ impl ClickThroughManager {
                 let scale = if scale > 0.0 { scale } else { 1.0 };
 
                 let mut pt = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
-                unsafe {
-                    windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt);
+                let cursor_ok = unsafe {
+                    // windows-sys 0.59 returns BOOL (i32): non-zero on success.
+                    windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt) != 0
+                };
+                if !cursor_ok {
+                    // The POINT was not filled in (e.g. no interactive
+                    // desktop), so both the hit-test and the cursor emit
+                    // would run on garbage coordinates this tick.
+                    continue;
                 }
 
                 let cur_x = pt.x as f64;
@@ -63,7 +72,10 @@ impl ClickThroughManager {
                 let rel_x = ((cur_x - win_x) / scale).round() as i32;
                 let rel_y = ((cur_y - win_y) / scale).round() as i32;
 
-                let is_inside = if let Ok(guard) = bounds_clone.lock() {
+                // Poison recovery: a panicked writer must not turn every
+                // later hit-test into "cursor outside" forever.
+                let is_inside = {
+                    let guard = bounds_clone.lock().unwrap_or_else(|e| e.into_inner());
                     guard.iter().any(|r| {
                         let rx = r.x * scale;
                         let ry = r.y * scale;
@@ -74,14 +86,11 @@ impl ClickThroughManager {
                             && cur_y >= win_y + ry
                             && cur_y <= win_y + ry + rh
                     })
-                } else {
-                    false
                 };
 
                 // Toggle click-through when transition happens
-                let mut last_inside = last_inside_clone.lock().unwrap();
-                if is_inside != *last_inside {
-                    *last_inside = is_inside;
+                let was_inside = last_inside_clone.swap(is_inside, Ordering::SeqCst);
+                if is_inside != was_inside {
                     let _ = window.set_ignore_cursor_events(!is_inside);
                 }
 

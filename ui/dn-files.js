@@ -426,6 +426,18 @@
     });
   });
 
+  // Rust mengirim files:drag-leave saat drag OS keluar dari notch tanpa
+  // drop. State "tab Files terbuka" sendiri ada di React chunk (listener
+  // files:drag-nya mengabaikan payload), jadi dari sini state itu tidak
+  // bisa direset: kita re-broadcast sebagai DOM CustomEvent supaya script
+  // lain bisa mengosongkan hover/dropzone miliknya.
+  window.bridge?.on("files:drag-leave", () => {
+    try {
+      window.dispatchEvent(new CustomEvent("files:drag-leave"));
+    } catch (_) {}
+    log("drag leave: batal hover drag");
+  });
+
   window.bridge?.on("clipboard:new", (p) => {
     if (!p) return;
     const text = String(p.text || "");

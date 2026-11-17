@@ -1,6 +1,6 @@
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter};
 
 pub const WM_HOTKEY: u32 = 0x0312;
@@ -44,6 +44,9 @@ extern "system" {
 pub struct HotkeyManager {
     is_busy: Arc<AtomicBool>,
     is_live: Arc<AtomicBool>,
+    /// Combos whose RegisterHotKey failed (held by another app). Reported
+    /// honestly by "dnptt:set-hotkeys" instead of a fake empty list.
+    reg_failed: Arc<Mutex<Vec<&'static str>>>,
 }
 
 impl HotkeyManager {
@@ -51,7 +54,17 @@ impl HotkeyManager {
         Self {
             is_busy: Arc::new(AtomicBool::new(false)),
             is_live: Arc::new(AtomicBool::new(false)),
+            reg_failed: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    pub fn registration_failures(&self) -> Vec<String> {
+        self.reg_failed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     }
 
     pub fn set_busy(&self, busy: bool) {
@@ -68,49 +81,63 @@ impl HotkeyManager {
 
     pub fn start_listener<R: tauri::Runtime>(&self, app: AppHandle<R>) {
         let is_busy = Arc::clone(&self.is_busy);
+        let reg_failed = Arc::clone(&self.reg_failed);
+        // Record a failed combo exactly once (RegisterHotKey returns 0 on failure).
+        let note_failed = move |label: &'static str| {
+            if let Ok(mut f) = reg_failed.lock() {
+                if !f.contains(&label) {
+                    f.push(label);
+                }
+            }
+        };
 
         std::thread::spawn(move || {
             unsafe {
                 // Hotkey 1: Ctrl + Alt + V (0x56) -> Command Mode
-                RegisterHotKey(
+                if RegisterHotKey(
                     std::ptr::null_mut(),
                     HOTKEY_COMMAND,
                     MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
                     0x56,
-                );
+                ) == 0
+                {
+                    note_failed("Ctrl+Alt+V");
+                }
 
                 // Hotkey 2: Ctrl + Alt + D (0x44) -> Dictate Mode
-                RegisterHotKey(
+                if RegisterHotKey(
                     std::ptr::null_mut(),
                     HOTKEY_DICTATE,
                     MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
                     0x44,
-                );
+                ) == 0
+                {
+                    note_failed("Ctrl+Alt+D");
+                }
 
                 // Hotkey 3: Escape (0x1B) -> Dismiss / Stop speech / Stop session
-                RegisterHotKey(
-                    std::ptr::null_mut(),
-                    HOTKEY_ESCAPE,
-                    0,
-                    0x1B,
-                );
+                if RegisterHotKey(std::ptr::null_mut(), HOTKEY_ESCAPE, 0, 0x1B) == 0 {
+                    note_failed("Esc");
+                }
 
                 // Hotkey 4: Alt + C (0x43) -> Open Chat / Conversation
-                RegisterHotKey(
-                    std::ptr::null_mut(),
-                    HOTKEY_CHAT,
-                    MOD_ALT | MOD_NOREPEAT,
-                    0x43,
-                );
+                if RegisterHotKey(std::ptr::null_mut(), HOTKEY_CHAT, MOD_ALT | MOD_NOREPEAT, 0x43)
+                    == 0
+                {
+                    note_failed("Alt+C");
+                }
 
                 // Hotkey 5 (slot LIVE yang tidak terpakai): Ctrl + Alt + C ->
                 // buka tab Ask (tanya singkat)
-                RegisterHotKey(
+                if RegisterHotKey(
                     std::ptr::null_mut(),
                     HOTKEY_LIVE,
                     MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
                     0x43,
-                );
+                ) == 0
+                {
+                    note_failed("Ctrl+Alt+C");
+                }
 
                 let mut msg: MSG = std::mem::zeroed();
                 while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {

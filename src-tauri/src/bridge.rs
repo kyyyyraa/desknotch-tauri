@@ -7,15 +7,174 @@ use crate::system;
 use crate::voice::VoiceManager;
 use crate::win;
 use serde_json::Value;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
+
+// ------------------------------------------------------------- spotify: uri --
+// `spotify:` URIs are opened with ShellExecuteW (shell32), never cmd.exe, so
+// there is no command interpreter to inject into. The allowlist still blocks
+// quotes, whitespace and shell metacharacters so the value cannot break out of
+// the protocol handler's command template. '%' is allowed on purpose: the only
+// caller (dn-voice-exec.js) sends encodeURIComponent() output, which escapes
+// every space as %NN — without it every search containing a space would be
+// rejected and silently fall back to the web player.
+fn is_safe_spotify_uri(uri: &str) -> bool {
+    if !uri.starts_with("spotify:") || uri.len() > 256 {
+        return false;
+    }
+    uri.chars().all(|c| {
+        c.is_ascii_alphanumeric()
+            || matches!(
+                c,
+                ':' | '/' | '?' | '=' | '&' | '-' | '_' | '.' | '%' | '!' | '~' | '*' | '(' | ')'
+            )
+    })
+}
+
+/// Open a URI through the shell association for its protocol. Returns true
+/// only when ShellExecuteW reports success (HINSTANCE > 32).
+fn open_uri_via_shell(uri: &str) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let file: Vec<u16> = std::ffi::OsStr::new(uri)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let verb: Vec<u16> = std::ffi::OsStr::new("open")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // windows-sys 0.59: HWND/HINSTANCE are *mut c_void, string params are
+    // PCWSTR (*const u16), nshowcmd is SHOW_WINDOW_CMD (i32).
+    let res = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    } as isize;
+    // HINSTANCE > 32 means success.
+    res > 32
+}
+
+// -------------------------------------------------------------- screenshots --
+// Screenshot paths come from the `screenshot:new` event (src/screenshot.rs):
+// PNG/JPG files Windows drops into %USERPROFILE%\Pictures\Screenshots or the
+// OneDrive variant. `screenshot:discard`/`screenshot:rename` receive that path
+// back from the renderer, so it must be pinned to those directories before it
+// touches the filesystem (same base-dir logic as ScreenshotWatcher::start).
+fn screenshot_base_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(user_profile) = std::env::var("USERPROFILE") {
+        dirs.push(
+            PathBuf::from(user_profile)
+                .join("Pictures")
+                .join("Screenshots"),
+        );
+    }
+    if let Ok(one_drive) = std::env::var("OneDrive") {
+        let p = PathBuf::from(one_drive).join("Pictures").join("Screenshots");
+        if !dirs.contains(&p) {
+            dirs.push(p);
+        }
+    }
+    dirs
+}
+
+/// Extensions the screenshot watcher emits (src/screenshot.rs).
+fn is_screenshot_ext(ext: &str) -> bool {
+    matches!(ext.to_lowercase().as_str(), "png" | "jpg" | "jpeg")
+}
+
+/// Strip the \\?\ verbatim prefix that std::fs::canonicalize adds on Windows
+/// so the renderer keeps seeing plain C:\... paths.
+fn strip_verbatim_prefix(p: PathBuf) -> PathBuf {
+    let s = p.as_os_str().to_string_lossy().into_owned();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{}", rest));
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest);
+    }
+    p
+}
+
+/// Validate a raw screenshot path from the renderer: it must canonicalize to
+/// an existing file inside one of the watched Screenshots directories and
+/// carry a screenshot extension. Returns the canonical (verbatim) path.
+fn validate_screenshot_path(raw: &str) -> Result<PathBuf, String> {
+    if raw.is_empty() {
+        return Err("empty screenshot path".to_string());
+    }
+    let target = std::fs::canonicalize(raw)
+        .map_err(|e| format!("screenshot path not found: {} ({})", raw, e))?;
+    let canonical_bases: Vec<PathBuf> = screenshot_base_dirs()
+        .iter()
+        .filter_map(|b| std::fs::canonicalize(b).ok())
+        .collect();
+    if canonical_bases.is_empty() {
+        return Err("no Screenshots directory available".to_string());
+    }
+    // starts_with compares path components, so .../Screenshots-evil/... does
+    // not match the .../Screenshots base.
+    if !canonical_bases.iter().any(|b| target.starts_with(b)) {
+        return Err("screenshot path escapes the Screenshots directory".to_string());
+    }
+    let ext = target.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if !is_screenshot_ext(ext) {
+        return Err(format!("not a screenshot extension: {}", ext));
+    }
+    Ok(target)
+}
+
+/// Reject anything that is not a single plain filename: no separators, no
+/// dot-dot, no trailing dot/space, no reserved device names.
+fn sanitize_filename(name: &str) -> Result<String, String> {
+    let cleaned = name.trim();
+    if cleaned.is_empty() {
+        return Err("filename is empty".to_string());
+    }
+    if cleaned.contains('/')
+        || cleaned.contains('\\')
+        || cleaned.contains("..")
+        || cleaned.contains(':')
+        || cleaned.contains('\0')
+    {
+        return Err("filename contains path separators or traversal".to_string());
+    }
+    if Path::new(cleaned).file_name().and_then(|f| f.to_str()) != Some(cleaned) {
+        return Err("filename is not a single plain name".to_string());
+    }
+    if cleaned.ends_with('.') || cleaned.ends_with(' ') {
+        return Err("filename ends with '.' or space".to_string());
+    }
+    let stem = cleaned.split('.').next().unwrap_or("").to_uppercase();
+    if matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6"
+            | "COM7" | "COM8" | "COM9" | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6"
+            | "LPT7" | "LPT8" | "LPT9"
+    ) {
+        return Err("filename is a reserved device name".to_string());
+    }
+    Ok(cleaned.to_string())
+}
 
 pub struct AppState {
     pub store: StoreManager,
     pub click_through: ClickThroughManager,
-    pub voice: Arc<VoiceManager>,
+    /// None when WinRT TTS failed to initialize: voice features degrade to
+    /// honest errors instead of refusing to start the whole app.
+    pub voice: Option<Arc<VoiceManager>>,
     pub pipe: PipeServerManager,
-    pub ocr: Arc<WinRtOcr>,
+    /// None when the Windows OCR engine/language pack is unavailable.
+    pub ocr: Option<Arc<WinRtOcr>>,
     pub window_watcher: crate::window_watcher::WindowWatcher,
     pub approval: ApprovalGate,
 }
@@ -74,12 +233,18 @@ pub async fn bridge_invoke(
         }
         "app:open-uri" => {
             let uri = args.get(0).and_then(|v| v.as_str()).unwrap_or("");
-            if uri.starts_with("spotify:") {
-                let _ = std::process::Command::new("cmd")
-                    .args(&["/c", "start", "", uri])
-                    .spawn();
-                Ok(Value::Bool(true))
+            if is_safe_spotify_uri(uri) {
+                let ok = open_uri_via_shell(uri);
+                if !ok {
+                    eprintln!("[app:open-uri] ShellExecuteW failed to open spotify uri");
+                }
+                Ok(Value::Bool(ok))
             } else {
+                eprintln!(
+                    "[app:open-uri] rejected unsafe/non-spotify uri (len={}): {:?}",
+                    uri.len(),
+                    &uri[..uri.len().min(48)]
+                );
                 Ok(Value::Bool(false))
             }
         }
@@ -142,22 +307,45 @@ pub async fn bridge_invoke(
             Ok(win::get_foreground_window_info())
         }
         "dnptt:set-hotkeys" => {
-            Ok(serde_json::json!({ "ok": true, "failed": [] }))
+            // Hotkey combos are compiled in (Ctrl+Alt+V/D, Ctrl+Alt+C, Alt+C,
+            // Esc) and were registered at startup — report the REAL failures
+            // (combo held by another app) instead of a fake empty list.
+            let failed = state
+                .voice
+                .as_ref()
+                .map(|v| v.hotkeys.registration_failures())
+                .unwrap_or_default();
+            Ok(serde_json::json!({
+                "ok": true,
+                "failed": failed,
+                "fixed": true,
+                "command": "Ctrl+Alt+V",
+                "dictate": "Ctrl+Alt+D",
+                "shortAsk": "Ctrl+Alt+C"
+            }))
         }
         "dnvoice:speak-onecore" | "dnvoice:speak-ps" => {
             let text = args.get(0)
                 .and_then(|v| v.get("text"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let duration_ms = state.voice.speak(text)?;
+            let duration_ms = state
+                .voice
+                .as_ref()
+                .ok_or_else(|| "Voice/TTS unavailable on this system".to_string())?
+                .speak(text)?;
             Ok(serde_json::json!({ "ok": true, "duration_ms": duration_ms }))
         }
         "dnvoice:stop-onecore" | "dnvoice:stop-ps" => {
-            state.voice.stop_speech();
+            if let Some(v) = state.voice.as_ref() {
+                v.stop_speech();
+            }
             Ok(Value::Bool(true))
         }
         "dnvoice:list-onecore" | "dnvoice:list-ps" => {
-            Ok(serde_json::json!(state.voice.list_voices()))
+            Ok(serde_json::json!(
+                state.voice.as_ref().map(|v| v.list_voices()).unwrap_or_default()
+            ))
         }
         "voice:gpu_check" => {
             // Cheap existence probe: the model itself loads lazily on the
@@ -182,8 +370,12 @@ pub async fn bridge_invoke(
         "ocr:recognize" => {
             let req = args.get(0);
             let path = req.and_then(|v| v.get("path")).and_then(|v| v.as_str());
+            let ocr = state
+                .ocr
+                .as_ref()
+                .ok_or_else(|| "OCR unavailable on this system".to_string())?;
             let text = if let Some(p) = path {
-                state.ocr.recognize_file(p).map_err(|e| format!("{:?}", e))?
+                ocr.recognize_file(p).map_err(|e| format!("{:?}", e))?
             } else {
                 String::new()
             };
@@ -242,13 +434,48 @@ pub async fn bridge_invoke(
             Ok(Value::Bool(state.pipe.respond(id, decision)))
         }
         "settings:start-on-boot" => {
-            Ok(Value::Bool(true))
+            // The renderer passes the toggle state: a plain boolean, or an
+            // object carrying it. Registry writes are skipped when the
+            // entry already matches, so opening Settings never rewrites it.
+            let requested = args.get(0).and_then(|v| {
+                v.as_bool().or_else(|| {
+                    v.get("enabled")
+                        .or_else(|| v.get("enable"))
+                        .or_else(|| v.get("value"))
+                        .and_then(|b| b.as_bool())
+                })
+            });
+            match requested {
+                Some(enable) => {
+                    let already = crate::system::start_on_boot_entry().is_some();
+                    if already != enable {
+                        let applied = crate::system::set_start_on_boot(enable)?;
+                        if !applied {
+                            // Dev build: the entry was deliberately not written.
+                            return Ok(Value::Bool(already));
+                        }
+                        eprintln!(
+                            "[DeskNotch] autostart {}",
+                            if enable { "enabled" } else { "disabled" }
+                        );
+                    }
+                    Ok(Value::Bool(enable))
+                }
+                None => Ok(Value::Bool(crate::system::start_on_boot_entry().is_some())),
+            }
         }
         "update:get" => {
-            Ok(serde_json::json!({ "status": "idle", "version": "1.0.5" }))
+            // No updater is built into DeskNotch — report the real compile-time
+            // version with status "idle" (the Settings panel renders nothing
+            // for "idle", which is the honest display for "no update system").
+            Ok(serde_json::json!({
+                "status": "idle",
+                "version": env!("CARGO_PKG_VERSION"),
+                "supported": false
+            }))
         }
         "update:check" => {
-            Ok(serde_json::json!({ "status": "idle" }))
+            Ok(serde_json::json!({ "status": "idle", "supported": false }))
         }
         "app:is-store" => {
             Ok(Value::Bool(false))
@@ -269,7 +496,51 @@ pub async fn bridge_invoke(
                 Ok(plain) => Ok(Value::String(plain)),
                 Err(e) => {
                     if sealed.starts_with("sk-") {
-                        Ok(Value::String(sealed.to_string()))
+                        // Legacy plaintext key from before DPAPI sealing existed.
+                        // One-way migration: seal it now and persist the sealed
+                        // form into the same settings entry dn-router.js reads
+                        // (settings.dnRouterKeySealed), then return the
+                        // plaintext one last time. Future calls receive the
+                        // DPAPI-sealed value and decrypt normally, so the
+                        // plaintext never hits this branch again.
+                        match crate::crypto::seal_key(sealed) {
+                            Ok(new_sealed) if !new_sealed.is_empty() => {
+                                let mut next = match state.store.get("settings").as_object() {
+                                    Some(obj) => obj.clone(),
+                                    None => serde_json::Map::new(),
+                                };
+                                next.insert(
+                                    "dnRouterKeySealed".to_string(),
+                                    Value::String(new_sealed),
+                                );
+                                let persisted = state
+                                    .store
+                                    .set(&app, "settings".to_string(), Value::Object(next));
+                                if persisted {
+                                    eprintln!(
+                                        "[dnrouter:open] plaintext sk- key migrated to DPAPI-sealed store entry"
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "[dnrouter:open] WARNING: could not persist migrated key; plaintext will be returned again"
+                                    );
+                                }
+                                Ok(Value::String(sealed.to_string()))
+                            }
+                            Ok(_) => {
+                                eprintln!(
+                                    "[dnrouter:open] WARNING: DPAPI seal produced empty output; plaintext key returned unmigrated"
+                                );
+                                Ok(Value::String(sealed.to_string()))
+                            }
+                            Err(se) => {
+                                eprintln!(
+                                    "[dnrouter:open] WARNING: DPAPI seal failed ({}); plaintext key returned unmigrated",
+                                    se
+                                );
+                                Ok(Value::String(sealed.to_string()))
+                            }
+                        }
                     } else {
                         eprintln!("[dnrouter:open] error: {}", e);
                         Ok(Value::Null)
@@ -352,11 +623,15 @@ pub async fn bridge_invoke(
         }
         "screenshot:discard" => {
             let path = args.get(0).and_then(|v| v.as_str()).unwrap_or("");
-            if !path.is_empty() {
-                let _ = std::fs::remove_file(path);
-                Ok(Value::Bool(true))
-            } else {
-                Ok(Value::Bool(false))
+            if path.is_empty() {
+                return Ok(Value::Bool(false));
+            }
+            match validate_screenshot_path(path) {
+                Ok(valid) => match std::fs::remove_file(&valid) {
+                    Ok(_) => Ok(Value::Bool(true)),
+                    Err(e) => Err(format!("Failed to delete screenshot: {}", e)),
+                },
+                Err(e) => Err(format!("Failed to delete screenshot: {}", e)),
             }
         }
         "screenshot:rename" => {
@@ -365,22 +640,31 @@ pub async fn bridge_invoke(
             if path.is_empty() || new_name.is_empty() {
                 return Ok(Value::Null);
             }
-            let old_p = std::path::Path::new(path);
-            if let Some(parent) = old_p.parent() {
+            let result = (|| -> Result<String, String> {
+                let old_p = validate_screenshot_path(path)?;
+                let name = sanitize_filename(new_name)?;
+                // Preserve the original extension logic: keep the screenshot's
+                // extension, appending it when the new name lacks it.
                 let ext = old_p.extension().and_then(|e| e.to_str()).unwrap_or("");
                 let new_filename = if ext.is_empty() {
-                    new_name.to_string()
-                } else if new_name.ends_with(&format!(".{}", ext)) {
-                    new_name.to_string()
+                    name
+                } else if name.ends_with(&format!(".{}", ext)) {
+                    name
                 } else {
-                    format!("{}.{}", new_name, ext)
+                    format!("{}.{}", name, ext)
                 };
+                let parent = old_p
+                    .parent()
+                    .ok_or_else(|| "screenshot has no parent directory".to_string())?;
                 let new_path = parent.join(new_filename);
-                if std::fs::rename(old_p, &new_path).is_ok() {
-                    return Ok(Value::String(new_path.to_string_lossy().to_string()));
-                }
+                std::fs::rename(&old_p, &new_path)
+                    .map_err(|e| format!("Failed to rename screenshot: {}", e))?;
+                Ok(strip_verbatim_prefix(new_path).to_string_lossy().to_string())
+            })();
+            match result {
+                Ok(new_path) => Ok(Value::String(new_path)),
+                Err(e) => Err(e),
             }
-            Ok(Value::Null)
         }
         "notch:tucked" => {
             Ok(Value::Bool(state.window_watcher.is_tucked()))
@@ -474,7 +758,7 @@ pub async fn bridge_invoke(
         }
         other => {
             eprintln!("[bridge_invoke] unhandled channel: {}", other);
-            Ok(Value::Null)
+            Err(format!("Unsupported channel: {}", other))
         }
     }
 }
@@ -498,17 +782,22 @@ pub async fn bridge_send(
             app.exit(0);
         }
         "live:start" => {
-            state.voice.hotkeys.set_live(true);
-            state.voice.hotkeys.set_busy(true);
+            if let Some(v) = state.voice.as_ref() {
+                v.hotkeys.set_live(true);
+                v.hotkeys.set_busy(true);
+            }
         }
         "live:stop" => {
-            state.voice.hotkeys.set_live(false);
-            state.voice.hotkeys.set_busy(false);
-            state.voice.stop_speech();
-            state.voice.abort_recording();
+            if let Some(v) = state.voice.as_ref() {
+                v.hotkeys.set_live(false);
+                v.hotkeys.set_busy(false);
+                v.stop_speech();
+                v.abort_recording();
+            }
         }
         "dnvoice:speaking-state" => {
-            // Speech active indicator
+            // Fire-and-forget indicator broadcast: the renderer announces TTS
+            // state; there is intentionally no backend action or fake reply.
         }
         "dnptt:log" => {
             // Renderer-side PTT trace: without this the log file only shows
@@ -518,11 +807,15 @@ pub async fn bridge_send(
             }
         }
         "dnptt:done" => {
-            state.voice.hotkeys.set_busy(false);
+            if let Some(v) = state.voice.as_ref() {
+                v.hotkeys.set_busy(false);
+            }
         }
         "dnptt:abort" => {
-            state.voice.hotkeys.set_busy(false);
-            state.voice.abort_recording();
+            if let Some(v) = state.voice.as_ref() {
+                v.hotkeys.set_busy(false);
+                v.abort_recording();
+            }
         }
         other => {
             eprintln!("[bridge_send] unhandled channel: {}", other);

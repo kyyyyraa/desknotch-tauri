@@ -9,7 +9,7 @@
  *   bridge.on(channel, callback)     -> unlisten()
  *   bridge.pathOf(file)              -> string
  *
- * Two rules drive the implementation.
+ * Three rules drive the implementation.
  *
  *   1. `invoke` and `send` never reject. The renderer calls them bare in a
  *      dozen places (`void bridge.invoke("media:key", "next")`,
@@ -17,14 +17,26 @@
  *      see a promise rejection, `bridge.send("dnptt:log", ...)` whose result
  *      nobody awaits). A rejected promise therefore surfaces as an unhandled
  *      rejection and takes the notch down with it. Every transport failure is
- *      folded into a fallback value instead.
+ *      folded into a fallback value instead — but never silently: every error
+ *      goes to `console.error` and into the `window.__DN_IPC_ERRORS` ring
+ *      buffer (max 50 entries) so debugging is possible.
  *
  *   2. The backend answers unknown channels with `null` (see bridge.rs), and
  *      the renderer dereferences some of those results without a guard
  *      (`apps:describe` -> `e.join("|")`, `privacy:get` -> `D.micApps.join()`,
  *      `desktime:screen-time` -> `Z.installed`). Channels listed in
  *      FALLBACKS get a shape-preserving value so a missing backend feature
- *      can never crash the UI.
+ *      can never crash the UI. Each fallback substitution is announced via
+ *      `console.warn('[DeskNotch IPC fallback used]', channel)` and recorded
+ *      in the same ring buffer.
+ *
+ *   3. Events are delivered as a single `callback(payload)` argument — the
+ *      exact value Rust passed to `emit` (object, scalar or null), not
+ *      spread. The ONE documented exception is `store:changed`
+ *      (src-tauri/src/store.rs emits it as a raw `[key, value]` array and
+ *      three renderer listeners are written as `function (key, value)`);
+ *      spread applies only to channels listed in TUPLE_CHANNELS or to an
+ *      explicit `{ __tupleArgs: [...] }` envelope.
  *
  * This file must be loaded before any other script: the renderer reads
  * `window.bridge` while it boots.
@@ -57,7 +69,8 @@
     'ai:limits': function () { return []; },
     'smtc:get': function () { return null; },
     'desktime:screen-time': function () { return { installed: false, ms: null }; },
-    'update:get': function () { return { status: 'idle', version: '1.0.4' }; },
+    // Version mirrors src-tauri/tauri.conf.json.
+    'update:get': function () { return { status: 'idle', version: '1.0.5' }; },
     'update:check': function () { return { status: 'idle' }; },
     'notch:tucked': function () { return false; },
 
@@ -108,8 +121,46 @@
     'dnai:request-approval': function () { return false; }
   };
 
+  /**
+   * Channels whose Rust emitter sends a raw JS array as the payload and whose
+   * renderer listeners were written variadic. As of the current emit inventory
+   * this is exactly one channel:
+   *
+   *   store:changed  <- store.rs emits `json!([key, value])`
+   *                      (listeners: dn-conversation.js, dn-extras.js,
+   *                       dn-files.js — all `function (key, value)`)
+   *
+   * If a future emitter adopts the explicit envelope, send
+   * `{ __tupleArgs: [a, b] }` instead and drop the whitelist entry.
+   */
+  var TUPLE_CHANNELS = { 'store:changed': true };
+
   function tauriGlobal() {
     return typeof window !== 'undefined' && window.__TAURI__ ? window.__TAURI__ : null;
+  }
+
+  /**
+   * Ring buffer of recent IPC problems, exposed as `window.__DN_IPC_ERRORS`
+   * (max 50, oldest dropped). Entries: `{ at, kind, channel, message }` where
+   * `kind` is 'invoke', 'send' or 'fallback'. Lets debugging answer "why does
+   * the battery widget show 100%" without guessing which call failed.
+   */
+  var MAX_IPC_ERRORS = 50;
+  var ipcErrors = [];
+
+  function recordIpcError(kind, channel, error) {
+    try {
+      var message = error instanceof Error ? error.message : String(error);
+      ipcErrors.push({
+        at: new Date().toISOString(),
+        kind: kind,
+        channel: channel,
+        message: message
+      });
+      if (ipcErrors.length > MAX_IPC_ERRORS) {
+        ipcErrors.splice(0, ipcErrors.length - MAX_IPC_ERRORS);
+      }
+    } catch (_) { /* never let bookkeeping break the call */ }
   }
 
   function hasFallback(channel) {
@@ -135,8 +186,18 @@
       typeof value.then === 'function';
   }
 
-  function warn(message) {
-    try { console.warn(message); } catch (_) { /* console may be unavailable */ }
+  function warn() {
+    try { console.warn.apply(console, arguments); } catch (_) { /* console may be unavailable */ }
+  }
+
+  function error() {
+    try { console.error.apply(console, arguments); } catch (_) { /* console may be unavailable */ }
+  }
+
+  /** Announce + record a fallback substitution (rule 2: never silently). */
+  function reportFallback(channel, why) {
+    warn('[DeskNotch IPC fallback used]', channel);
+    recordIpcError('fallback', channel, why);
   }
 
   /**
@@ -170,10 +231,21 @@
       return invokeTauri('bridge_invoke', { channel: channel, args: args })
         .then(function (result) {
           if (result === null || result === undefined) {
+            // `null` for channels without a FALLBACKS entry is the honest
+            // answer ("backend has nothing for this"); a substituted shape
+            // is not, so announce it.
+            if (hasFallback(channel)) {
+              reportFallback(channel, 'backend returned null; FALLBACK substituted');
+            }
             return fallbackFor(channel);
           }
           return result;
-        }, function () {
+        }, function (err) {
+          error('[DeskNotch IPC invoke]', channel, err);
+          recordIpcError('invoke', channel, err);
+          if (hasFallback(channel)) {
+            reportFallback(channel, 'invoke failed; FALLBACK substituted');
+          }
           return fallbackFor(channel);
         });
     },
@@ -187,13 +259,17 @@
       return invokeTauri('bridge_send', {
         channel: channel,
         data: data === undefined ? null : data
-      }).then(function () {}, function () {});
+      }).then(function () {}, function (err) {
+        error('[DeskNotch IPC send]', channel, err);
+        recordIpcError('send', channel, err);
+      });
     },
 
     /**
-     * Subscribes to a backend event. The callback keeps the variadic shape of
-     * the original IPC listener: an array payload is spread into the
-     * arguments, so `store:changed` still arrives as (key, value).
+     * Subscribes to a backend event. The callback receives the emitted
+     * payload as a single argument, exactly as Rust serialized it. Spread
+     * into separate arguments happens ONLY for the documented tuple
+     * channels below (and an explicit `__tupleArgs` envelope).
      *
      * `window.__TAURI__.event.listen` resolves with the unlisten function
      * instead of returning it, so the returned disposer waits for that
@@ -215,8 +291,15 @@
       function handler(event) {
         var payload = event ? event.payload : undefined;
         try {
-          if (Array.isArray(payload)) {
-            callback.apply(null, payload);
+          var tuple = null;
+          if (payload && typeof payload === 'object' &&
+              Array.isArray(payload.__tupleArgs)) {
+            tuple = payload.__tupleArgs;
+          } else if (TUPLE_CHANNELS[channel] && Array.isArray(payload)) {
+            tuple = payload;
+          }
+          if (tuple) {
+            callback.apply(null, tuple);
           } else {
             callback(payload);
           }
@@ -274,6 +357,8 @@
 
   if (typeof window !== 'undefined') {
     window.bridge = bridge;
+    // Live ring buffer (same array the shim splices) for debugging in devtools.
+    window.__DN_IPC_ERRORS = ipcErrors;
   }
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = bridge;

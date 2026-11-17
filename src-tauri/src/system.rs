@@ -976,3 +976,146 @@ pub async fn diagnose_system() -> Value {
         "notes": notes
     })
 }
+
+const RUN_KEY_PATH: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+const RUN_VALUE_NAME: &str = "DeskNotch";
+/// Reads the current autostart entry. Returns the stored command line, if any.
+#[cfg(windows)]
+pub fn start_on_boot_entry() -> Option<String> {
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegGetValueW, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE,
+        RRF_RT_REG_SZ,
+    };
+
+    unsafe {
+        let mut hkey: HKEY = std::ptr::null_mut();
+        let subkey: Vec<u16> = RUN_KEY_PATH
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let name: Vec<u16> = RUN_VALUE_NAME
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
+        if RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_QUERY_VALUE, &mut hkey) != 0 {
+            return None;
+        }
+
+        let mut buf: Vec<u16> = vec![0; 1024];
+        let mut len: u32 = buf.len() as u32;
+        let status = RegGetValueW(
+            hkey,
+            std::ptr::null(),
+            name.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            buf.as_mut_ptr().cast(),
+            &mut len,
+        );
+        RegCloseKey(hkey);
+
+        if status != 0 {
+            return None;
+        }
+        let text = String::from_utf16_lossy(&buf[..len.saturating_sub(1) as usize]);
+        if text.trim().is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn start_on_boot_entry() -> Option<String> {
+    None
+}
+
+/// True when the running exe lives inside a cargo build directory. Dev
+/// builds must not register an autostart entry: the path disappears with
+/// the next `cargo clean`, which leaves Windows pointing at a dead file.
+#[cfg(windows)]
+fn is_dev_build_exe(exe: &std::path::Path) -> bool {
+    exe.components().any(|c| c.as_os_str() == "target")
+}
+
+/// Real autostart toggle: writes/removes HKCU\...\Run\DeskNotch pointing at
+/// the running exe (quoted — the install path contains spaces).
+/// Returns Ok(true) when the registry now reflects the requested state.
+#[cfg(windows)]
+pub fn set_start_on_boot(enable: bool) -> Result<bool, String> {
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
+        KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SZ,
+    };
+
+    const ERROR_FILE_NOT_FOUND: u32 = 2;
+
+    unsafe {
+        let mut hkey: HKEY = std::ptr::null_mut();
+        let subkey: Vec<u16> = RUN_KEY_PATH
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let name: Vec<u16> = RUN_VALUE_NAME
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let status = RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            0,
+            KEY_SET_VALUE | KEY_QUERY_VALUE,
+            &mut hkey,
+        );
+        if status != 0 {
+            return Err(format!("buka registry Run gagal (kode {})", status));
+        }
+
+        let result = if enable {
+            let exe = std::env::current_exe()
+                .map_err(|e| format!("path exe tidak tersedia: {}", e))?;
+            if is_dev_build_exe(&exe) {
+                eprintln!(
+                    "[DeskNotch] autostart dilewati: exe dev build {}",
+                    exe.display()
+                );
+                Ok(false)
+            } else {
+            let cmdline = format!("\"{}\"", exe.display());
+            let val: Vec<u16> = cmdline.encode_utf16().chain(std::iter::once(0)).collect();
+            let status = RegSetValueExW(
+                hkey,
+                name.as_ptr(),
+                0,
+                REG_SZ,
+                val.as_ptr().cast(),
+                (val.len() as u32) * 2,
+            );
+            if status == 0 {
+                Ok(true)
+            } else {
+                Err(format!("tulis nilai Run gagal (kode {})", status))
+            }
+            }
+        } else {
+            let status = RegDeleteValueW(hkey, name.as_ptr());
+            // Removing an absent entry still satisfies "not on boot".
+            if status == 0 || status == ERROR_FILE_NOT_FOUND {
+                Ok(true)
+            } else {
+                Err(format!("hapus nilai Run gagal (kode {})", status))
+            }
+        };
+
+        RegCloseKey(hkey);
+        result
+    }
+}
+
+#[cfg(not(windows))]
+pub fn set_start_on_boot(_enable: bool) -> Result<bool, String> {
+    Err("autostart hanya didukung di Windows".into())
+}

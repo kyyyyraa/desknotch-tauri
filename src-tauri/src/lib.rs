@@ -36,18 +36,21 @@ pub fn run() {
     let pipe = PipeServerManager::new();
     let window_watcher = WindowWatcher::new();
     let notif_watcher = NotificationWatcher::new();
+    // Voice and OCR are optional: a missing TTS voice or OCR language pack
+    // must not stop the notch from starting. The affected features report an
+    // honest error instead.
     let voice = match VoiceManager::new() {
-        Ok(v) => Arc::new(v),
+        Ok(v) => Some(Arc::new(v)),
         Err(e) => {
-            eprintln!("[DeskNotch] VoiceManager init failed: {}", e);
-            panic!("Cannot start without VoiceManager: {}", e);
+            eprintln!("[DeskNotch] VoiceManager unavailable, voice features disabled: {}", e);
+            None
         }
     };
     let ocr = match WinRtOcr::new() {
-        Ok(o) => Arc::new(o),
+        Ok(o) => Some(Arc::new(o)),
         Err(e) => {
-            eprintln!("[DeskNotch] WinRtOcr init failed: {:?}", e);
-            panic!("Cannot start without WinRtOcr: {:?}", e);
+            eprintln!("[DeskNotch] WinRtOcr unavailable, OCR features disabled: {:?}", e);
+            None
         }
     };
 
@@ -55,14 +58,14 @@ pub fn run() {
     let app_state = AppState {
         store,
         click_through: click_through.clone(),
-        voice: Arc::clone(&voice),
+        voice: voice.clone(),
         pipe: pipe.clone(),
         ocr,
         window_watcher: window_watcher.clone(),
         approval: crate::approval_gate::ApprovalGate::new(),
     };
 
-    let voice_hotkeys = Arc::clone(&voice);
+    let voice_hotkeys = voice.clone();
 
     tauri::Builder::default()
         .manage(app_state)
@@ -102,8 +105,11 @@ pub fn run() {
         });
     }
 
-    // Start global hotkeys (Ctrl+Alt+V, Ctrl+Alt+D, Escape)
-            voice_hotkeys.hotkeys.start_listener(app.handle().clone());
+    // Start global hotkeys (Ctrl+Alt+V, Ctrl+Alt+D, Escape). Hotkeys live on
+    // the VoiceManager, so without TTS there is nothing to register.
+            if let Some(v) = voice_hotkeys.as_ref() {
+                v.hotkeys.start_listener(app.handle().clone());
+            }
 
             if let Some(window) = app.get_webview_window("main") {
                 // Start window watcher (hideOnFullscreen & tuckForBrowsers)
@@ -131,15 +137,19 @@ pub fn run() {
                 }
 
                 // Drag & drop files onto the notch: "files:drag" opens the
-                // files tab while hovering, "shelf:dropped" carries the
-                // dropped paths to the renderer.
+                // files tab while hovering, "files:drag-leave" clears that
+                // hover state when the drag leaves without dropping, and
+                // "shelf:dropped" carries the dropped paths to the renderer.
                 let window_dd = window.clone();
                 window.on_window_event(move |event| {
                     if let tauri::WindowEvent::DragDrop(drag) = event {
                         use tauri::Emitter;
                         match drag {
                             tauri::DragDropEvent::Enter { .. } => {
-                                let _ = window_dd.emit("files:drag", ());
+                                let _ = window_dd.emit(
+                                    "files:drag",
+                                    serde_json::json!({ "active": true }),
+                                );
                             }
                             tauri::DragDropEvent::Drop { paths, .. } => {
                                 let paths: Vec<String> = paths
@@ -151,7 +161,14 @@ pub fn run() {
                                     serde_json::json!({ "paths": paths }),
                                 );
                             }
-                            // Leave (dan Over): tidak perlu emit.
+                            tauri::DragDropEvent::Leave { .. } => {
+                                let _ = window_dd.emit(
+                                    "files:drag-leave",
+                                    serde_json::json!({ "active": false }),
+                                );
+                            }
+                            // Over fires continuously while hovering: too
+                            // frequent to emit anything.
                             _ => {}
                         }
                     }
