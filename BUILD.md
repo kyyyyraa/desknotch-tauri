@@ -21,6 +21,34 @@ Versi: **1.0.5** (`src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json`).
 | `whisper-cuda/` | CLI whisper.cpp CUDA 12.4 + runtime DLL (transkripsi di RTX 3050) | ~700 MB |
 | `ui/dn-models/whisper-small/` | model ONNX — **fallback** kalau native gagal | 249 MB |
 
+## Restore runtime whisper GPU
+
+Kalau `whisper-cuda/` atau `desknotch-models/` hilang (mis. setelah bersih-bersih
+disk), transkripsi diam-diam jatuh ke fallback ONNX WASM di `ui/dn-models/`
+yang jalan di CPU/RAM - 15-30 detik per clip. Itu yang harus dihindari.
+
+```sh
+# 1. CLI whisper.cpp CUDA 12.4 (zip 429 MB -> folder 670 MB)
+curl -L -o whisper-cublas.zip https://github.com/ggml-org/whisper.cpp/releases/download/v1.8.0/whisper-cublas-12.4.0-bin-x64.zip
+unzip -q whisper-cublas.zip -d whisper_cublas
+# whisper.dll WAJIB ikut di folder yang sama dengan whisper-cli.exe
+cp whisper_cublas/Release/*.dll whisper_cublas/Release/whisper-cli.exe whisper-cuda/
+
+# 2. model GGML (466 MB)
+curl -L -o desknotch-models/ggml-small.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin
+```
+
+Verifikasi (harus keluar `found 1 CUDA devices` dan `use gpu = 1`):
+
+```sh
+cd whisper-cuda && ./whisper-cli.exe -m ../desknotch-models/ggml-small.bin -f suara.wav -t 4 -nt -l auto
+```
+
+Catatan: run pertama setelah cache kernel CUDA hilang butuh ~70 detik (NVRTC
+meng-JIT-compile kernel untuk GPU laptop). Run berikutnya ~4 detik.
+Kalau `voice:gpu_check` mengembalikan `{ "ok": false }`, berarti CLI atau model
+tidak ditemukan - app otomatis pakai fallback ONNX.
+
 ## Build ulang
 
 ```sh
